@@ -41,7 +41,21 @@ def create_standby_groups(
     coord_store_port: int,
     enable_eplb: bool = True,
     backend: str | None = None,
+    survivor_old_dp_ranks: list[int] | None = None,
 ) -> None:
+    """
+    Create standby DP/EP/EPLB process groups.
+
+    ``survivor_old_dp_ranks``: when provided (ungraceful-removal path),
+    the standby group uses these OLD DP ranks instead of the default
+    contiguous ``range(new_dp_size)``. Each surviving engine still
+    presents its OLD ``world.rank`` to the StatelessGroupCoordinator,
+    which then computes ``rank_in_group`` via ``ranks.index(world.rank)``.
+    The default contiguous numbering only works when the survivors
+    happen to be the first ``new_dp_size`` ranks (graceful scale-down
+    drops trailing ranks). For an arbitrary dead set we must pass the
+    real survivor ranks so each survivor finds itself in the list.
+    """
     global \
         _STANDBY_WORLD, \
         _STANDBY_WORLD_NODE_COUNT, \
@@ -51,14 +65,37 @@ def create_standby_groups(
 
     from vllm.distributed.utils import get_cached_tcp_store_client
 
-    assert new_world_size_across_dp == torch.distributed.get_world_size() * new_dp_size
+    _td_world_size = torch.distributed.get_world_size()
+    assert (
+        new_world_size_across_dp == _td_world_size * new_dp_size
+    ), (
+        f"create_standby_groups arg mismatch: "
+        f"new_world_size_across_dp={new_world_size_across_dp}, "
+        f"torch.distributed.get_world_size()={_td_world_size}, "
+        f"new_dp_size={new_dp_size}"
+    )
     world_group = get_world_group()
-    assert isinstance(world_group, StatelessGroupCoordinator)
+    assert isinstance(world_group, StatelessGroupCoordinator), (
+        f"world_group is {type(world_group).__name__}, "
+        f"expected StatelessGroupCoordinator"
+    )
     backend = backend or world_group.backend
 
     coord_store = get_cached_tcp_store_client(master_ip, coord_store_port)
 
-    standby_world_ranks = [list(range(new_world_size_across_dp))]
+    if survivor_old_dp_ranks is not None:
+        # tp_size and pp_size are read below before they are known here;
+        # but for our supported topology (TP=PP=PCP=1 in elastic EP) the
+        # world rank == DP rank, so the survivor list is the ranks list
+        # for both world and DP groups. (The general case would expand
+        # each DP rank to the matching range of world ranks.)
+        assert len(survivor_old_dp_ranks) == new_dp_size, (
+            f"survivor_old_dp_ranks {survivor_old_dp_ranks} length must "
+            f"equal new_dp_size {new_dp_size}"
+        )
+        standby_world_ranks = [list(survivor_old_dp_ranks)]
+    else:
+        standby_world_ranks = [list(range(new_world_size_across_dp))]
     _STANDBY_WORLD = _init_stateless_group(
         standby_world_ranks,
         "world",
@@ -72,19 +109,32 @@ def create_standby_groups(
     tp_size = get_tp_group().world_size
     pp_size = get_pp_group().world_size
 
-    all_ranks = torch.arange(new_world_size_across_dp).reshape(
-        -1, new_dp_size, pp_size, tp_size
-    )
-    standby_dp_ranks = all_ranks.transpose(1, 3).reshape(-1, new_dp_size).unbind(0)
-    standby_dp_ranks = [x.tolist() for x in standby_dp_ranks]
+    if survivor_old_dp_ranks is not None:
+        # Hard-remove path: TP/PP/PCP=1, so dp_ranks == world_ranks ==
+        # ep_ranks. Build them all from the survivor list directly.
+        assert tp_size == 1 and pp_size == 1, (
+            "Hard-remove mode currently assumes TP=PP=1 (world rank == "
+            "DP rank). Got tp_size=%d pp_size=%d." % (tp_size, pp_size)
+        )
+        standby_dp_ranks = [list(survivor_old_dp_ranks)]
+        standby_ep_ranks = [list(survivor_old_dp_ranks)]
+    else:
+        all_ranks = torch.arange(new_world_size_across_dp).reshape(
+            -1, new_dp_size, pp_size, tp_size
+        )
+        standby_dp_ranks = all_ranks.transpose(1, 3).reshape(
+            -1, new_dp_size
+        ).unbind(0)
+        standby_dp_ranks = [x.tolist() for x in standby_dp_ranks]
+
+        standby_ep_ranks = (
+            all_ranks.transpose(1, 2).reshape(-1, new_dp_size * tp_size).unbind(0)
+        )
+        standby_ep_ranks = [x.tolist() for x in standby_ep_ranks]
+
     _STANDBY_DP = _init_stateless_group(
         standby_dp_ranks, "dp", master_ip, backend, coord_store=coord_store
     )
-
-    standby_ep_ranks = (
-        all_ranks.transpose(1, 2).reshape(-1, new_dp_size * tp_size).unbind(0)
-    )
-    standby_ep_ranks = [x.tolist() for x in standby_ep_ranks]
     _STANDBY_EP = _init_stateless_group(
         standby_ep_ranks, "ep", master_ip, backend, coord_store=coord_store
     )

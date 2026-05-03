@@ -1207,7 +1207,21 @@ def _replace_active_groups(
     global _WORLD, _DP, _EP, _EPLB, _NODE_COUNT
     for group in (_DP, _EP, _WORLD, _EPLB):
         if group is not None:
-            group.destroy()
+            try:
+                group.destroy()
+            except Exception as e:
+                # Tolerate failures here — when this is called as part
+                # of an ungraceful-removal recovery (a peer was killed
+                # with SIGKILL), the gloo TCP pair to the dead rank is
+                # broken, and the gloo `shutdown` collective in destroy
+                # raises "Connection closed by peer". Swallow it: we
+                # still want to install the new groups so the survivors
+                # can keep serving on a fresh comm topology.
+                logger.warning(
+                    "Suppressed error while destroying old comm group %r: %s",
+                    group,
+                    e,
+                )
     _WORLD = world
     _DP = dp
     _EP = ep

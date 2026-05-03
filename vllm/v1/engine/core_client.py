@@ -687,6 +687,16 @@ class MPClient(EngineCoreClient):
         if response.dp_stats_address is not None:
             if self.stats_update_address is None:
                 self.stats_update_address = response.dp_stats_address
+                # If the eager call in __init__ deferred (no address yet),
+                # start the task now that we have one — but only if a loop
+                # is running and we're a DPAsyncMPClient subclass with the
+                # method.
+                if hasattr(self, "_ensure_stats_update_task"):
+                    try:
+                        asyncio.get_running_loop()
+                        self._ensure_stats_update_task()
+                    except RuntimeError:
+                        pass
             else:
                 assert response.dp_stats_address == self.stats_update_address
 
@@ -946,22 +956,32 @@ class AsyncMPClient(MPClient):
                     resources.validate_alive(frames)
                     outputs: EngineCoreOutputs = decoder.decode(frames)
                     if outputs.utility_output:
-                        if (
-                            outputs.utility_output.call_id == EEP_NOTIFICATION_CALL_ID
-                            and notification_callback_handler is not None
-                        ):
-                            assert _self_ref is not None
-                            _self = _self_ref()
-                            if not _self:
-                                return
-                            if outputs.utility_output.result is None:
-                                continue
-                            notification_data = outputs.utility_output.result.result
-                            assert isinstance(notification_data, Sequence)
-                            assert len(notification_data) == 2
-                            asyncio.create_task(
-                                notification_callback_handler(_self, notification_data)
-                            )
+                        if outputs.utility_output.call_id == EEP_NOTIFICATION_CALL_ID:
+                            # Elastic-EP coordination notification from the
+                            # engine's busy loop. With external-LB topology
+                            # (one AsyncLLM per rank), the orchestrator owns
+                            # cross-rank coordination, so we drop the
+                            # notification here unless this client class
+                            # implements its own handler. Without this branch
+                            # _process_utility_output would try to pop -1
+                            # from utility_results and KeyError.
+                            if notification_callback_handler is not None:
+                                assert _self_ref is not None
+                                _self = _self_ref()
+                                if not _self:
+                                    return
+                                if outputs.utility_output.result is None:
+                                    continue
+                                notification_data = (
+                                    outputs.utility_output.result.result
+                                )
+                                assert isinstance(notification_data, Sequence)
+                                assert len(notification_data) == 2
+                                asyncio.create_task(
+                                    notification_callback_handler(
+                                        _self, notification_data
+                                    )
+                                )
                         else:
                             _process_utility_output(
                                 outputs.utility_output, utility_results
@@ -1181,7 +1201,12 @@ class DPAsyncMPClient(AsyncMPClient):
         if resources.stats_update_task is not None:
             return
 
-        assert self.stats_update_address is not None
+        # In single-engine-per-frontend topologies (one AsyncLLM per Ray
+        # actor), only rank 0 sees the coordinator address up-front; other
+        # ranks discover it via the engine's ready response. Defer the
+        # task creation until the address arrives.
+        if self.stats_update_address is None:
+            return
         stats_addr: str = self.stats_update_address
         assert len(self.engine_ranks_managed) > 0
 
@@ -1301,8 +1326,11 @@ class DPAsyncMPClient(AsyncMPClient):
 
         chosen_engine = self.get_core_engine_for_request(request)
         to_await = self._send_input(EngineCoreRequestType.ADD, request, chosen_engine)
-        if not self.engines_running:
-            # Notify coordinator that we're sending a request
+        if not self.engines_running and self.resources.stats_update_task is not None:
+            # Notify coordinator that we're sending a request. Only send when
+            # the stats task is running — otherwise the PAIR socket has no
+            # peer and the send blocks indefinitely. (Single-engine-per-
+            # frontend topologies may run without a stats coordinator.)
             req_msg = msgspec.msgpack.encode(("FIRST_REQ", chosen_engine))
             await self.first_req_send_socket.send(req_msg)
 

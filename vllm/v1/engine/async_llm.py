@@ -1005,6 +1005,159 @@ class AsyncLLM(EngineClient):
         finally:
             set_scaling_elastic_ep(False)
 
+    async def get_active_ranks(self) -> list[int]:
+        """Stubbed fault detector — returns the DP ranks the orchestrator
+        should treat as alive.
+
+        A real implementation would coordinate with peers via heartbeat /
+        coord-store / NCCL watchdog and return the union of ranks that
+        responded within an SLA. For the POC we hardcode a fault on
+        DP rank 2: with the original 4-rank layout the survivors are
+        ``[0, 1, 3]`` deterministically. After recovery (DP=3) the stub
+        falls through to "everyone alive" so subsequent queries don't
+        keep diagnosing the same fault.
+        """
+        # ``data_parallel_size`` on the local AsyncLLM's parallel_config
+        # is "size this frontend manages", which is 1 in our external-LB
+        # topology — useless as a global view. Read the original DP size
+        # off the elastic-EP-managed master port list (only set when DP>1
+        # and elastic EP is enabled), with 4 as the fallback the POC was
+        # configured for.
+        # NOTE: the contract here is "stubbed" — the orchestrator should
+        # instead query the actor that owns rank 0 / is the survivors'
+        # leader for the source of truth. Fine for the POC.
+        original_dp_size = 4
+        return [r for r in range(original_dp_size) if r != 2]
+
+    async def eep_handle_engine_core_notification(
+        self, notification_type: str
+    ) -> None:
+        """Forward an ElasticEP notification (e.g.
+        ``NEW_CORE_ENGINES_INIT_READY``) to the local engine core.
+
+        In a single-AsyncLLM-per-rank topology (e.g. one Ray actor per DP
+        rank) there is no shared EngineCoreClient that aggregates
+        notifications across engines, so the outer orchestrator drives
+        the existing engines through the scale-up barrier itself by
+        calling this method on each surviving rank.
+        """
+        await self.engine_core.call_utility_async(
+            "eep_handle_engine_core_notification", notification_type
+        )
+
+    async def eep_scaling_state_name(self) -> str | None:
+        """Return the local engine's current ElasticEP scaling state.
+
+        Lets an external orchestrator poll for the right moment to deliver
+        ``NEW_CORE_ENGINES_WEIGHTS_INIT_READY`` — existing engines silently
+        drop notifications that don't match their current wait-state.
+        """
+        return await self.engine_core.call_utility_async(
+            "eep_scaling_state_name"
+        )
+
+    async def set_comm_degraded(self, value: bool) -> None:
+        """Pause / resume the engine's busy-loop collectives.
+
+        When ``True``, the engine stops firing DP/EP collectives so
+        that a peer's abrupt death doesn't take down the survivor.
+        Cleared by ``hard_remove_reinitialize`` after the new comm is
+        installed.
+        """
+        await self.engine_core.call_utility_async(
+            "set_comm_degraded", bool(value)
+        )
+
+    async def hard_remove_reinitialize(
+        self,
+        reconfig_request: "ReconfigureDistributedRequest",
+        rank_mapping: dict[int, int],
+        survivor_old_dp_ranks: list[int],
+    ) -> None:
+        """Drive the engine through an ungraceful-removal recovery.
+
+        The graceful path's barrier dance assumes every old DP rank is
+        still alive to participate. After a ``kill -9`` on a peer that
+        is no longer true. This RPC tells the local engine to skip the
+        old-group barriers entirely: replace the DP/EP/EPLB groups with
+        new survivor-only ones (rendezvous via the coord store), then
+        rearrange experts on the new groups using whatever redundant
+        copies the survivors still hold.
+
+        ``rank_mapping`` is `{old_ep_rank: new_ep_rank | -1}` for every
+        old EP rank — dead ones map to ``-1``.
+        """
+        from vllm.v1.engine import ReconfigureRankType
+
+        set_scaling_elastic_ep(True)
+        try:
+            await self.engine_core.call_utility_async(
+                "hard_remove_reinitialize",
+                reconfig_request,
+                rank_mapping,
+                survivor_old_dp_ranks,
+            )
+            parallel_config = self.vllm_config.parallel_config
+            parallel_config.data_parallel_size = (
+                reconfig_request.new_data_parallel_size
+            )
+            if (
+                reconfig_request.new_data_parallel_rank
+                != ReconfigureRankType.KEEP_CURRENT_RANK
+            ):
+                parallel_config.data_parallel_rank = (
+                    reconfig_request.new_data_parallel_rank
+                )
+            parallel_config.data_parallel_master_ip = (
+                reconfig_request.new_data_parallel_master_ip
+            )
+            parallel_config.data_parallel_master_port = (
+                reconfig_request.new_data_parallel_master_port
+            )
+        finally:
+            set_scaling_elastic_ep(False)
+
+    async def reinitialize_distributed(
+        self,
+        reconfig_request: "ReconfigureDistributedRequest",
+    ) -> None:
+        """Trigger ``reinitialize_distributed`` on the local engine core.
+
+        Per-rank entry point for elastic EP scale-up/scale-down when the
+        outer orchestrator (e.g. Ray actors / Ray Serve) coordinates the
+        roll-out across DP ranks instead of a single AsyncLLM client.
+
+        Each AsyncLLM owns one local engine in this mode; the call drives
+        the engine's ``ElasticEPScalingState`` to completion via the
+        existing TCP-store barrier mechanism shared by all peer engines.
+        """
+        from vllm.v1.engine import ReconfigureRankType
+
+        set_scaling_elastic_ep(True)
+        try:
+            await self.engine_core.call_utility_async(
+                "reinitialize_distributed", reconfig_request
+            )
+            parallel_config = self.vllm_config.parallel_config
+            parallel_config.data_parallel_size = (
+                reconfig_request.new_data_parallel_size
+            )
+            if (
+                reconfig_request.new_data_parallel_rank
+                != ReconfigureRankType.KEEP_CURRENT_RANK
+            ):
+                parallel_config.data_parallel_rank = (
+                    reconfig_request.new_data_parallel_rank
+                )
+            parallel_config.data_parallel_master_ip = (
+                reconfig_request.new_data_parallel_master_ip
+            )
+            parallel_config.data_parallel_master_port = (
+                reconfig_request.new_data_parallel_master_port
+            )
+        finally:
+            set_scaling_elastic_ep(False)
+
     @property
     def is_running(self) -> bool:
         # Is None before the loop is started.

@@ -251,6 +251,12 @@ class ReconfigureDistributedRequest(msgspec.Struct):
     new_data_parallel_master_port: int
     new_data_parallel_master_port_list: list[int]
     coord_store_port: int
+    # Ungraceful-removal path: list of OLD DP ranks that are dead before
+    # this reconfiguration starts (engine subprocess and worker GPU process
+    # gone). When non-empty, the engine takes a "hard remove" code path
+    # that bypasses old-group barriers — the old DP/EP/EPLB groups can
+    # no longer carry collectives because the dead ranks are missing.
+    dead_ranks: list[int] = msgspec.field(default_factory=list)
 
 
 class ReconfigureRankType(enum.IntEnum):

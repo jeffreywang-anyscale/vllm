@@ -530,6 +530,7 @@ def stateless_init_torch_distributed_process_group(
     group_name: str | None = None,
     return_store: bool = False,
     listen_socket: socket.socket | None = None,
+    timeout_seconds: float | None = None,
 ) -> ProcessGroup | tuple[ProcessGroup, Store]:
     """
     A replacement for `torch.distributed.init_process_group` that does not
@@ -569,7 +570,10 @@ def stateless_init_torch_distributed_process_group(
     """
     init_method = get_tcp_uri(host, port)
     backend = Backend(backend)  # it is basically string
-    timeout = _get_default_timeout(backend)
+    if timeout_seconds is not None:
+        timeout = timedelta(seconds=timeout_seconds)
+    else:
+        timeout = _get_default_timeout(backend)
 
     if listen_socket is not None:
         store = create_tcp_store(

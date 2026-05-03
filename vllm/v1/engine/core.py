@@ -832,6 +832,14 @@ class EngineCoreProc(EngineCore):
         identity = self.engine_index.to_bytes(length=2, byteorder="little")
         self.engines_running = False
         self.shutdown_state = EngineShutdownState.RUNNING
+        # When True, the busy loop polls the input queue for utility
+        # requests (e.g. ``hard_remove_reinitialize``) but does NOT fire
+        # any DP/EP collectives, ``execute_dummy_batch``, or engine step.
+        # Set externally by the orchestrator after it observes a peer
+        # failure but before it has had a chance to install new comm
+        # groups — the existing groups have a dead participant and any
+        # collective on them blows up the survivors.
+        self.comm_degraded = False
 
         # Receiver for tensor IPC
         self.tensor_ipc_receiver: TensorIpcReceiver | None = None
@@ -952,6 +960,26 @@ class EngineCoreProc(EngineCore):
         input_ctx = zmq.Context()
         is_local = local_client and client_handshake_address is None
         headless = not local_client
+        # Elastic-EP scale-up shortcut: a freshly-spawned new rank cannot
+        # complete the rank-0 TCP handshake because the rank-0 front-end is
+        # past wait_for_engine_startup (it transitioned to normal serving
+        # at the end of bring-up). Skip the rank-0 leg in that case and
+        # let the colocated front-end provide everything we need; the
+        # ElasticEPScalingState picks up coordination via the coord_store
+        # in _eep_scale_up_before_kv_init.
+        skip_rank0_handshake = (
+            envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH
+            and client_handshake_address is not None
+            and local_client
+        )
+        if skip_rank0_handshake:
+            local_handshake = self._perform_handshake(
+                input_ctx, client_handshake_address, identity, True, False, vllm_config
+            )
+            with local_handshake as addresses:
+                yield addresses
+            vllm_config.__post_init__()
+            return
         handshake = self._perform_handshake(
             input_ctx,
             handshake_address,
@@ -1795,6 +1823,16 @@ class DPEngineCoreProc(EngineCoreProc):
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
 
+            if self.comm_degraded:
+                # A peer DP rank has died; the active dp/ep/eplb groups
+                # have a missing participant. Skip step / dummy_batch /
+                # sync_dp_state — those would call gloo or NCCL on the
+                # broken group and tear this engine down. We sit on the
+                # input queue waiting for the orchestrator's
+                # ``hard_remove_reinitialize`` to install fresh comm.
+                time.sleep(0.01)
+                continue
+
             if self.eep_scaling_state is not None:
                 _ = self.eep_scaling_state.progress()
                 if self.eep_scaling_state.is_complete():
@@ -1807,19 +1845,36 @@ class DPEngineCoreProc(EngineCoreProc):
             self._maybe_publish_request_counts()
 
             local_unfinished_reqs = self.scheduler.has_unfinished_requests()
-            if not executed:
-                if not local_unfinished_reqs and not self.engines_running:
-                    # All engines are idle.
-                    continue
+            try:
+                if not executed:
+                    if not local_unfinished_reqs and not self.engines_running:
+                        # All engines are idle.
+                        continue
 
-                # We are in a running state and so must execute a dummy pass
-                # if the model didn't execute any ready requests.
-                self.execute_dummy_batch()
+                    # We are in a running state and so must execute a dummy
+                    # pass if the model didn't execute any ready requests.
+                    self.execute_dummy_batch()
 
-            # 3) All-reduce operation to determine global unfinished reqs.
-            self.engines_running = self._has_global_unfinished_reqs(
-                local_unfinished_reqs
-            )
+                # 3) All-reduce operation to determine global unfinished reqs.
+                self.engines_running = self._has_global_unfinished_reqs(
+                    local_unfinished_reqs
+                )
+            except Exception as e:
+                # Either a peer died abruptly (gloo "Connection closed by
+                # peer", NCCL watchdog timeout, etc.) or the busy-loop
+                # collectives drifted out of phase and one of these calls
+                # hung past its timeout. Either way we don't want to take
+                # the engine down — the orchestrator has a recovery path
+                # (``hard_remove_reinitialize``) that will install fresh
+                # comm. Mark this engine degraded and keep the input
+                # queue draining so the recovery RPC can land.
+                logger.warning(
+                    "[busy_loop] comm error, marking engine degraded: %s",
+                    e,
+                )
+                self.comm_degraded = True
+                self.engines_running = False
+                continue
 
             if not self.engines_running:
                 if self.dp_rank == 0 or not self.has_coordinator:
@@ -1961,6 +2016,165 @@ class DPEngineCoreProc(EngineCoreProc):
         if isinstance(notification_type, str):
             notification_type = EEPNotificationType(notification_type)
         self.eep_scaling_state.handle_notification(notification_type)
+
+    def set_comm_degraded(self, value: bool) -> None:
+        """Toggle the ``comm_degraded`` flag.
+
+        The orchestrator calls ``set_comm_degraded(True)`` on each
+        survivor right before SIGKILLing a peer (or right after
+        observing its death) so the busy loop stops firing collectives
+        on the about-to-be-broken DP/EP/EPLB groups. The recovery RPC
+        clears the flag on its way out.
+        """
+        self.comm_degraded = bool(value)
+        if value:
+            # Reset wave-running state so the busy loop returns to idle
+            # the moment it next checks. With comm degraded we won't
+            # close the wave properly via sync_dp_state, so without
+            # this the post-recovery loop tries dummy_batch immediately.
+            self.engines_running = False
+
+    def hard_remove_reinitialize(
+        self,
+        reconfig_request: ReconfigureDistributedRequest,
+        rank_mapping: dict[int, int],
+        survivor_old_dp_ranks: list[int],
+    ) -> None:
+        """Ungraceful-removal counterpart to ``reinitialize_distributed``.
+
+        Used when one or more peer DP ranks have died abruptly (kill -9
+        on the GPU process). The TCP-store + NCCL barrier dance in the
+        graceful state machine cannot make progress because dead ranks
+        never reach the barriers, so we bypass it entirely:
+
+          * the engine builds a new (engine-side) DP group of size
+            ``new_dp_size`` over the survivor coord store,
+          * the worker builds new DP/EP/EPLB groups for itself via
+            ``hard_remove_execute`` and swaps the active comm,
+          * the worker rearranges experts on the NEW groups using the
+            redundant copies still resident on survivors.
+
+        ``rank_mapping`` is `{old_ep_rank: new_ep_rank | -1}` for every
+        old rank — dead ranks map to ``-1``. The orchestrator computes
+        this from the diff between the original DP layout and the
+        active-ranks list it observed.
+        """
+        from copy import deepcopy
+
+        from vllm.distributed.utils import (
+            stateless_destroy_torch_distributed_process_group,
+        )
+
+        new_parallel_config = deepcopy(self.vllm_config.parallel_config)
+        new_parallel_config.data_parallel_size = (
+            reconfig_request.new_data_parallel_size
+        )
+        if (
+            reconfig_request.new_data_parallel_rank
+            != ReconfigureRankType.KEEP_CURRENT_RANK
+        ):
+            new_parallel_config.data_parallel_rank = (
+                reconfig_request.new_data_parallel_rank
+            )
+        new_parallel_config.data_parallel_master_ip = (
+            reconfig_request.new_data_parallel_master_ip
+        )
+        new_parallel_config.data_parallel_master_port = (
+            reconfig_request.new_data_parallel_master_port
+        )
+        new_parallel_config._data_parallel_master_port_list = (
+            reconfig_request.new_data_parallel_master_port_list
+        )
+        new_parallel_config._coord_store_port = reconfig_request.coord_store_port
+
+        # Drive the worker through abort old / build new / reshuffle.
+        self.model_executor.collective_rpc(
+            "elastic_ep_execute",
+            args=(
+                "hard_remove_execute",
+                reconfig_request,
+                rank_mapping,
+                survivor_old_dp_ranks,
+            ),
+        )
+
+        # Build a new engine-side DP gloo group over the survivors. This
+        # must happen AFTER collective_rpc returns so that all survivor
+        # engines arrive concurrently at the rendezvous (the worker call
+        # above is synchronous and serialised). The new ranks land at
+        # 0..new_dp_size-1 — survivors' parallel_config.data_parallel_rank
+        # has been updated to the compacted rank.
+        old_dp_group = getattr(self, "dp_group", None)
+        new_dp_group, new_dp_store = (
+            new_parallel_config.stateless_init_dp_group(return_store=True)
+        )
+        self.dp_group = new_dp_group
+        self.dp_store = new_dp_store
+        if old_dp_group is not None:
+            try:
+                stateless_destroy_torch_distributed_process_group(old_dp_group)
+            except Exception as e:
+                logger.warning(
+                    "[Elastic EP] suppressed error destroying old engine "
+                    "dp_group: %s",
+                    e,
+                )
+
+        # Mirror what ScaleDownRemainingEngineState._update_parallel_config
+        # would do for the graceful path.
+        parallel_config = self.vllm_config.parallel_config
+        parallel_config.data_parallel_size = (
+            reconfig_request.new_data_parallel_size
+        )
+        if (
+            reconfig_request.new_data_parallel_rank
+            != ReconfigureRankType.KEEP_CURRENT_RANK
+        ):
+            parallel_config.data_parallel_rank = (
+                reconfig_request.new_data_parallel_rank
+            )
+        if (
+            reconfig_request.new_data_parallel_rank_local
+            != ReconfigureRankType.KEEP_CURRENT_RANK
+        ):
+            parallel_config.data_parallel_rank_local = (
+                reconfig_request.new_data_parallel_rank_local
+            )
+        parallel_config.data_parallel_master_ip = (
+            reconfig_request.new_data_parallel_master_ip
+        )
+        parallel_config.data_parallel_master_port = (
+            reconfig_request.new_data_parallel_master_port
+        )
+        self.dp_size = parallel_config.data_parallel_size
+        self.dp_rank = parallel_config.data_parallel_rank
+        # Restore normal busy-loop operation now that comm is on the
+        # new groups. ``set_comm_degraded(True)`` had already set
+        # engines_running=False, so the loop will idle until a request
+        # arrives.
+        self.comm_degraded = False
+        logger.info(
+            "[Elastic EP] hard_remove_reinitialize complete: dp_size=%d "
+            "dp_rank=%d (was old rank %d)",
+            self.dp_size,
+            self.dp_rank,
+            survivor_old_dp_ranks[self.dp_rank],
+        )
+
+    def eep_scaling_state_name(self) -> str | None:
+        """Return the name of the current ElasticEP scaling state, or None
+        when no reconfiguration is in progress.
+
+        Used by orchestrators that drive the state machine externally (e.g.
+        plain Ray actors with one AsyncLLM each) to poll for the right
+        moment to deliver ``NEW_CORE_ENGINES_WEIGHTS_INIT_READY`` — the
+        existing engines silently drop notifications whose corresponding
+        wait-state is not the current state.
+        """
+        if self.eep_scaling_state is None:
+            return None
+        state = self.eep_scaling_state.state
+        return state.name if hasattr(state, "name") else str(state)
 
     def _eep_scale_up_before_kv_init(self):
         from vllm.distributed.elastic_ep.elastic_state import ElasticEPScalingState

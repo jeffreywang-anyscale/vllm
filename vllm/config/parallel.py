@@ -305,6 +305,19 @@ class ParallelConfig:
     """Port of the coordination TCPStore. Can be set by the API server; workers
     connect as clients to exchange self-picked group ports at runtime."""
 
+    _dp_collective_timeout_seconds: float | None = None
+    """Override for the gloo timeout on the DP / EP / EPLB process groups.
+
+    When ``None`` (default) the per-backend default applies (30 minutes for
+    gloo, the NCCL watchdog timeout for NCCL). For elastic-EP fault recovery
+    a much shorter timeout is desirable — when a peer dies abruptly or the
+    busy loop's `dummy_batch` / `sync_dp_state` collectives drift out of
+    phase, the survivors' in-flight ``all_reduce`` would otherwise hang
+    until the 30-minute gloo recv timeout, blocking the orchestrator's
+    recovery RPC. Setting this to e.g. 60s lets the busy loop catch the
+    error via its try/except and self-degrade so recovery can proceed.
+    """
+
     decode_context_parallel_size: int = 1
     """Number of decode context parallel groups, because the world size does
     not change by dcp, it simply reuse the GPUs of TP group, and tp_size
@@ -586,6 +599,7 @@ class ParallelConfig:
                     backend="gloo",
                     return_store=return_store,
                     listen_socket=listen_socket,
+                    timeout_seconds=self._dp_collective_timeout_seconds,
                 )
             except DistNetworkError as e:
                 # We only want to retry when the root cause is EADDRINUSE.
@@ -775,11 +789,9 @@ class ParallelConfig:
                     "Elastic EP is not supported with pipeline parallelism "
                     f"(pipeline_parallel_size={self.pipeline_parallel_size})."
                 )
-            if self.data_parallel_external_lb or self.data_parallel_hybrid_lb:
+            if self.data_parallel_hybrid_lb:
                 raise NotImplementedError(
-                    "Elastic EP is not compatible with data_parallel_external_lb "
-                    "or data_parallel_hybrid_lb. Elastic EP relies on a single API "
-                    "server and core client to coordinate scale up/down."
+                    "Elastic EP is not compatible with data_parallel_hybrid_lb."
                 )
 
         if self.data_parallel_size > 1 or self.data_parallel_size_local == 0:

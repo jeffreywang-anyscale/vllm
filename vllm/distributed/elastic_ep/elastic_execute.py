@@ -566,3 +566,64 @@ class ElasticEPScalingExecutor:
     def prepare_new_worker(self) -> None:
         with set_current_vllm_config(self.worker.vllm_config):
             prepare_communication_buffer_for_model(self.worker.model_runner.get_model())
+
+    def hard_remove_execute(
+        self,
+        reconfig_request: ReconfigureDistributedRequest,
+        rank_mapping: dict[int, int],
+        survivor_old_dp_ranks: list[int],
+    ) -> None:
+        """Worker-side end-to-end hard-remove sequence.
+
+        Order matters: the OLD DP/EP/EPLB groups can no longer carry
+        collectives (a participant rank's GPU process is gone), so we
+        must replace them BEFORE doing any expert reshuffle.
+
+        Phases (all on this worker):
+
+          1. Build standby DP/EP/EPLB groups via the coord store. Only
+             surviving ranks rendezvous, so this completes without the
+             dead rank's participation.
+          2. Abort the old NCCL communicators (best-effort) and swap
+             active groups to the new ones via ``_replace_active_groups``.
+             Same MoE/EPLB plumbing as ``switch_and_prepare`` for the
+             graceful scale-down path.
+          3. Run the EPLB rearrange on the *new* (survivor-only) groups
+             with a rank_mapping that says where the dead ranks' experts
+             used to live. ``rebalance_experts`` redistributes whatever
+             redundant copies survive across the remaining ranks.
+        """
+        # Phase 1: build new groups (rendezvous via coord store, dead
+        # ranks never participate).
+        self.reconfig_request = reconfig_request
+        new_dp_size = reconfig_request.new_data_parallel_size
+        old_dp_size = get_dp_group().world_size
+        world_size_per_dp = self.worker.vllm_config.parallel_config.world_size
+        new_world_size_across_dp = world_size_per_dp * new_dp_size
+        updated_config = copy.copy(self.worker.vllm_config)
+        updated_config.parallel_config = copy.deepcopy(
+            self.worker.vllm_config.parallel_config
+        )
+        updated_config.parallel_config.data_parallel_size = new_dp_size
+        with set_current_vllm_config(updated_config):
+            create_standby_groups(
+                new_dp_size=new_dp_size,
+                new_world_size_across_dp=new_world_size_across_dp,
+                master_ip=reconfig_request.new_data_parallel_master_ip,
+                coord_store_port=reconfig_request.coord_store_port,
+                enable_eplb=updated_config.parallel_config.enable_eplb,
+                survivor_old_dp_ranks=survivor_old_dp_ranks,
+            )
+
+        # Phase 2: switch active groups. Reuse switch_and_prepare's
+        # logic — it does CUDA-graph release, group swap, MoE config
+        # update, and EPLB num_redundant_experts adjustment.
+        self.switch_and_prepare()
+
+        # Phase 3: reshuffle experts on the new ep group. Pass the
+        # caller's rank_mapping (old_ep_rank -> new_ep_rank or -1 for
+        # dead). With redundancy in the original layout, surviving
+        # ranks collectively still cover most/all logical experts.
+        self._set_eplb_suppressed(True)
+        self._perform_eplb_reshuffle(rank_mapping=rank_mapping)
+        self._set_eplb_suppressed(False)
