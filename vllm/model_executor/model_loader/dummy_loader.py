@@ -43,6 +43,22 @@ class DummyModelLoader(BaseModelLoader):
                 # random values to the weights.
                 initialize_dummy_weights(layer, model_config)
 
+        # Keep dummy loading consistent with checkpoint loading for models
+        # that require a model-level post-load weight transformation. DeepSeek
+        # V4 MegaMoE, for example, packs its expert weights from its real
+        # ``load_weights`` implementation. Without this call, the first
+        # profile forward performs that packing while profiling is already
+        # holding its activation allocations, producing an artificial OOM.
+        #
+        # Some model wrappers expose the finalizer on the outer module while
+        # DeepSeek V4 exposes it on ``model.model``. Invoke at most one hook:
+        # a wrapper-level hook is responsible for delegating to its inner model.
+        for candidate in (model, getattr(model, "model", None)):
+            finalizer = getattr(candidate, "finalize_mega_moe_weights", None)
+            if callable(finalizer):
+                finalizer()
+                break
+
     def _process_online_quant_layer(
         self,
         layer: nn.Module,
